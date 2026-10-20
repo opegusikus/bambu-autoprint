@@ -1,0 +1,7 @@
+{
+  "listen": "0.0.0.0",
+  "port": 8765,
+  "token": "CHANGE-ME",
+  "data_dir": "data",
+  "max_late_minutes": 60
+}

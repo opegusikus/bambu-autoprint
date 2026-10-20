@@ -1,0 +1,6 @@
+printer.json
+server.json
+client.json
+data/
+__pycache__/
+.venv/
