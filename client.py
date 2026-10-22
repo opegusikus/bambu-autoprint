@@ -8,6 +8,7 @@
     python client.py status
     python client.py confirm <id>     # plate is clear again
     python client.py cancel <id>
+    python client.py light on|off
 
 Server URL and token are read from client.json (see client.example.json).
 """
@@ -108,7 +109,8 @@ def cmd_schedule(cfg, args):
             sys.exit("Cancelled.")
 
     query = {"name": path.name, "at": f"{when.timestamp():.0f}",
-             "ams": int(args.ams), "level": int(not args.no_level), "timelapse": int(args.timelapse)}
+             "external": int(args.external), "level": int(not args.no_level), "timelapse": int(args.timelapse),
+             "flow_cali": int(args.flow_cali), "vibration_cali": int(args.vibration_cali)}
     if args.plate:
         query["plate"] = args.plate
     if args.ams_mapping:
@@ -117,6 +119,8 @@ def cmd_schedule(cfg, args):
     job = api(cfg, "POST", "/jobs", query, path.read_bytes())
     print(f"Scheduled job {job['id']}: {job['name']} plate {job['plate']} at {fmt_time(job['at'])}"
           + ("" if args.now else f" (in {fmt_delta(job['at'] - now.timestamp())})"))
+    if job.get("filament"):
+        print(f"Filament: {job['filament']}")
     if job.get("warning"):
         print(f"Warning: {job['warning']}")
 
@@ -146,6 +150,12 @@ def cmd_confirm(cfg, args):
     print(f"Plate confirmed clear for job {job['id']} ({job['name']} at {fmt_time(job['at'])}).")
 
 
+def cmd_light(cfg, args):
+    result = api(cfg, "POST", "/light", {"state": args.state})
+    print(f"Light {args.state}." if result["confirmed"]
+          else f"Sent light {args.state}, but the printer didn't confirm it.")
+
+
 def cmd_cancel(cfg, args):
     job = api(cfg, "DELETE", f"/jobs/{args.id}")
     print(f"Cancelled job {job['id']} ({job['name']}).")
@@ -164,10 +174,14 @@ def main():
     when.add_argument("--in", dest="in_", help="delay, e.g. 45m, 2h, 2h30m")
     when.add_argument("--now", action="store_true", help="start as soon as possible")
     p.add_argument("--plate", type=int, help="plate number (default: the only sliced plate)")
-    p.add_argument("--ams", action="store_true", help="feed filament from the AMS")
-    p.add_argument("--ams-mapping", help="comma-separated AMS slot per filament, e.g. 0,2 (default: 1:1)")
+    p.add_argument("--external", action="store_true",
+                   help="use the external spool instead of the AMS")
+    p.add_argument("--ams-mapping", help="AMS slot per filament, 0-based (A1=0, A2=1...), e.g. 1,3 "
+                                         "(default: match by type and color)")
     p.add_argument("--no-level", action="store_true", help="skip bed leveling")
     p.add_argument("--timelapse", action="store_true", help="record a timelapse")
+    p.add_argument("--flow-cali", action="store_true", help="run flow dynamics calibration first")
+    p.add_argument("--vibration-cali", action="store_true", help="run vibration calibration first")
     p.add_argument("--yes", "-y", action="store_true", help="don't ask whether the plate will be clear")
 
     p = sub.add_parser("jobs", help="list upcoming jobs (or recent ones if none are upcoming)")
@@ -177,11 +191,13 @@ def main():
     p.add_argument("id")
     p = sub.add_parser("cancel", help="cancel a pending job")
     p.add_argument("id")
+    p = sub.add_parser("light", help="switch the chamber light")
+    p.add_argument("state", choices=["on", "off"])
 
     args = parser.parse_args()
     cfg = load_config(args.config)
     commands = {"schedule": cmd_schedule, "jobs": cmd_jobs, "status": cmd_status,
-                "confirm": cmd_confirm, "cancel": cmd_cancel}
+                "confirm": cmd_confirm, "cancel": cmd_cancel, "light": cmd_light}
     commands[args.command](cfg, args)
 
 

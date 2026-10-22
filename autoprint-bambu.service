@@ -2,8 +2,8 @@
 Description=Autoprint scheduler for Bambu Lab printer
 
 [Service]
-WorkingDirectory=%h/autoprint
-ExecStart=%h/autoprint/.venv/bin/python server.py
+WorkingDirectory=%h/autoprint-bambu
+ExecStart=%h/autoprint-bambu/.venv/bin/python server.py
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=10

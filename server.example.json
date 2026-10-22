@@ -3,5 +3,6 @@
   "port": 8765,
   "token": "CHANGE-ME",
   "data_dir": "data",
-  "max_late_minutes": 60
+  "max_late_minutes": 60,
+  "light_off_after_finish_minutes": 1
 }

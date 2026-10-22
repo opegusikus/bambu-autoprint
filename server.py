@@ -115,11 +115,12 @@ class Store:
 
 
 class Scheduler:
-    def __init__(self, store, printer, printer_cfg, max_late):
+    def __init__(self, store, printer, printer_cfg, max_late, light_off_delay=None):
         self.store = store
         self.printer = printer
         self.printer_cfg = printer_cfg
         self.max_late = max_late
+        self.light_off_delay = light_off_delay
 
     def on_state_change(self, old, new):
         log.info("Printer state: %s -> %s", old, new)
@@ -127,6 +128,19 @@ class Scheduler:
         # PREPARE/RUNNING means something is now on the plate.
         if new in ("PREPARE", "RUNNING") and old not in autoprint.BUSY_STATES:
             self.store.mark_print_started(time.time())
+        # Only a successful finish; after FAILED the light stays on for the camera.
+        # Runs on a timer thread: set_light waits for MQTT replies, which this thread delivers.
+        if new == "FINISH" and old in autoprint.BUSY_STATES and self.light_off_delay is not None:
+            threading.Timer(self.light_off_delay, self.light_off_after_finish).start()
+
+    def light_off_after_finish(self):
+        if self.printer.snapshot().get("gcode_state") != "FINISH":
+            return  # a new print started in the meantime
+        if not self.printer.online.is_set():
+            log.warning("Print finished, but the printer is offline; light not switched off")
+            return
+        confirmed = self.printer.set_light(False)
+        log.info("Print finished; light off%s", "" if confirmed else " (not confirmed by printer)")
 
     def plate_confirmed(self, job):
         return bool(job["confirmed_at"]) and job["confirmed_at"] > self.store.last_print_start
@@ -168,10 +182,14 @@ class Scheduler:
             self.store.save(job)
 
         log.info("Job %s (%s): starting", job["id"], job["name"])
+        path = self.store.job_file(job)
         try:
-            autoprint.run_print(self.printer, self.printer_cfg, self.store.job_file(job),
-                                job["plate"], job["use_ams"], job["ams_mapping"],
+            filaments = job.get("filaments") or autoprint.prepare_job(path, job["plate"])[1]
+            autoprint.run_print(self.printer, self.printer_cfg, path, job["plate"], filaments,
+                                job.get("external", False), job.get("ams_mapping"),
                                 bed_leveling=job["bed_leveling"], timelapse=job["timelapse"],
+                                flow_cali=job.get("flow_cali", False),
+                                vibration_cali=job.get("vibration_cali", False),
                                 log=log.info)
         except (autoprint.PrintError, ftplib.error_perm) as e:
             self.finish(job, "failed", str(e))
@@ -217,7 +235,7 @@ class App:
             plate = int(query["plate"]) if query.get("plate") else None
         except (KeyError, ValueError):
             raise ApiError(400, "'at' (unix time) is required; 'plate' must be a number")
-        use_ams = query.get("ams") == "1"
+        external = query.get("external") == "1"
 
         job_id = self.store.new_id()
         job = {"id": job_id, "name": name}
@@ -234,8 +252,8 @@ class App:
         try:
             if remaining:
                 raise autoprint.PrintError("Upload was cut short")
-            plate, ams_mapping = autoprint.prepare_job(
-                path, plate, use_ams, autoprint.parse_ams_mapping(query.get("ams_mapping")))
+            plate, filaments = autoprint.prepare_job(path, plate)
+            ams_mapping = autoprint.parse_ams_mapping(query.get("ams_mapping"))
         except autoprint.PrintError as e:
             shutil.rmtree(path.parent, ignore_errors=True)
             raise ApiError(400, str(e))
@@ -243,17 +261,37 @@ class App:
         busy = self.printer_busy()
         now = time.time()
         job.update(
-            created=now, at=at, plate=plate, use_ams=use_ams, ams_mapping=ams_mapping,
+            created=now, at=at, plate=plate, filaments=filaments, external=external, ams_mapping=ams_mapping,
             bed_leveling=query.get("level", "1") == "1", timelapse=query.get("timelapse") == "1",
+            flow_cali=query.get("flow_cali") == "1", vibration_cali=query.get("vibration_cali") == "1",
             confirmed_at=None if busy else now, status="pending", error=None, attempts=0,
         )
         self.store.save(job)
         log.info("Job %s (%s): scheduled for %s", job_id, name, time.ctime(at))
         result = dict(job)
+        warnings = []
         if busy:
-            result["warning"] = ("The printer is printing right now, so the plate can't be clear yet. "
-                                 f"Run `confirm {job_id}` after removing the current print.")
+            warnings.append("The printer is printing right now, so the plate can't be clear yet. "
+                            f"Run `confirm {job_id}` after removing the current print.")
+        if self.printer.online.is_set():
+            # Slots are matched again at start time; this just flags a problem early.
+            try:
+                result["filament"] = autoprint.resolve_filament_source(
+                    self.printer.snapshot(), filaments, external, ams_mapping)[2]
+            except autoprint.PrintError as e:
+                warnings.append(f"{e} The job will fail unless this is fixed before it starts.")
+        if warnings:
+            result["warning"] = "\n".join(warnings)
         return result
+
+    def set_light(self, state):
+        if state not in ("on", "off"):
+            raise ApiError(400, "state must be 'on' or 'off'")
+        if not self.printer.online.is_set():
+            raise ApiError(503, "Printer is offline")
+        confirmed = self.printer.set_light(state == "on")
+        log.info("Light %s%s", state, "" if confirmed else " (not confirmed by printer)")
+        return {"light": state, "confirmed": confirmed}
 
     def confirm_job(self, job_id):
         with self.store.lock:
@@ -310,6 +348,8 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= MAX_UPLOAD:
                 raise ApiError(400, f"Upload must be 1 byte to {MAX_UPLOAD // 1_048_576} MB")
             return self.app.create_job(query, self.rfile, length)
+        if method == "POST" and parts == ["light"]:
+            return self.app.set_light(query.get("state"))
         if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "confirm":
             return self.app.confirm_job(parts[1])
         if method == "DELETE" and len(parts) == 2 and parts[0] == "jobs":
@@ -342,7 +382,8 @@ def load_server_config(path):
     path = Path(path)
     if not path.exists():
         raise SystemExit(f"Config not found: {path}. Copy server.example.json to server.json and fill it in.")
-    cfg = {"listen": "0.0.0.0", "port": 8765, "data_dir": "data", "max_late_minutes": 60}
+    cfg = {"listen": "0.0.0.0", "port": 8765, "data_dir": "data", "max_late_minutes": 60,
+           "light_off_after_finish_minutes": 1}
     cfg.update(json.loads(path.read_text(encoding="utf-8")))
     if len(cfg.get("token", "")) < 16 or cfg["token"].startswith("CHANGE"):
         raise SystemExit("Set a random 'token' of at least 16 characters in server.json, e.g. from:\n"
@@ -366,7 +407,9 @@ def main():
     store = Store(HERE / cfg["data_dir"])
 
     printer = autoprint.Printer(printer_cfg)
-    scheduler = Scheduler(store, printer, printer_cfg, max_late=int(cfg["max_late_minutes"] * 60))
+    light_off = cfg["light_off_after_finish_minutes"]
+    scheduler = Scheduler(store, printer, printer_cfg, max_late=int(cfg["max_late_minutes"] * 60),
+                          light_off_delay=None if light_off is None else light_off * 60)
     printer.on_state_change = scheduler.on_state_change
     printer.start()
     threading.Thread(target=scheduler.run_forever, daemon=True).start()
